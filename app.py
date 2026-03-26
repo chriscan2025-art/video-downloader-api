@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import yt_dlp
 import os
@@ -37,18 +37,46 @@ def get_info():
 
         formats = []
         seen = set()
+
+        # Only get formats that have BOTH video+audio (no merging needed)
         for f in info.get("formats", []):
             height = f.get("height")
             ext = f.get("ext")
             vcodec = f.get("vcodec", "none")
-            if height and vcodec != "none" and ext in ["mp4", "webm"]:
-                label = f"{height}p ({ext})"
+            acodec = f.get("acodec", "none")
+
+            # Must have both video AND audio in same file
+            if height and vcodec != "none" and acodec != "none" and ext == "mp4":
+                label = f"{height}p (mp4)"
                 if label not in seen:
                     seen.add(label)
-                    formats.append({"format_id": f["format_id"], "label": label, "type": "video", "height": height, "ext": ext})
+                    formats.append({
+                        "format_id": f["format_id"],
+                        "label": label,
+                        "type": "video",
+                        "height": height,
+                        "ext": "mp4"
+                    })
 
         formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-        formats.append({"format_id": "bestaudio", "label": "MP3 Audio Only", "type": "audio", "ext": "mp3"})
+
+        # MP3 option
+        formats.append({
+            "format_id": "bestaudio",
+            "label": "MP3 Audio Only",
+            "type": "audio",
+            "ext": "mp3"
+        })
+
+        if not formats or len(formats) == 1:
+            # Fallback — best single file
+            formats.insert(0, {
+                "format_id": "best[ext=mp4]/best",
+                "label": "Best Quality (mp4)",
+                "type": "video",
+                "height": 999,
+                "ext": "mp4"
+            })
 
         return jsonify({
             "title": info.get("title", "Video"),
@@ -56,7 +84,7 @@ def get_info():
             "duration": info.get("duration", 0),
             "uploader": info.get("uploader", ""),
             "platform": info.get("extractor_key", ""),
-            "formats": formats[:10]
+            "formats": formats[:8]
         })
     except Exception as e:
         return jsonify({"error": "Could not fetch video. Check URL and try again."}), 400
@@ -65,8 +93,9 @@ def get_info():
 def download_video():
     data = request.json
     url = data.get("url", "").strip()
-    format_id = data.get("format_id", "best")
+    format_id = data.get("format_id", "best[ext=mp4]/best")
     is_audio = data.get("type", "video") == "audio"
+
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
@@ -75,17 +104,17 @@ def download_video():
 
     if is_audio:
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": output_path + ".%(ext)s",
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
             "quiet": True,
         }
     else:
+        # No merging — single file formats only
         ydl_opts = {
-            "format": f"{format_id}+bestaudio/best",
+            "format": f"{format_id}/best[ext=mp4]/best",
             "outtmpl": output_path + ".%(ext)s",
-            "merge_output_format": "mp4",
             "quiet": True,
+            "merge_output_format": None,
         }
 
     try:
@@ -108,7 +137,7 @@ def download_video():
 
         return send_file(downloaded_file, as_attachment=True, download_name=f"{safe_title}.{ext}")
     except Exception as e:
-        return jsonify({"error": "Download failed. Try another quality."}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
